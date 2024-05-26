@@ -10,7 +10,9 @@ set -e
 TARGET_ZPOOL="croot"
 TARGET_IMAGE_PATH=$(pwd)
 TARGET_IMAGE_NAME="ubuntu-cloudimg-zfs.raw"
+TARGET_ROOT_MOUNTPOINT=$(pwd)/tmp_root
 
+# Inherited from ZBM setup procedure.
 BOOT_PART="1"
 POOL_PART="2"
 ID="ubuntu"
@@ -91,6 +93,9 @@ setup_disk() {
     cmd zfs create -o mountpoint=/home ${TARGET_ZPOOL}/home
 
     cmd zpool set bootfs=${TARGET_ZPOOL}/ROOT/${ID} "$TARGET_ZPOOL"
+
+    # Format the efi boot partition.
+    cmd mkfs.vfat -F32 "$BOOT_DEVICE"
 }
 
 export_zpool() {
@@ -103,6 +108,21 @@ export_zpool() {
     done
 }
 
+mount_filesystems() {
+    [ -d $TARGET_ROOT_MOUNTPOINT ] || cmd mkdir -p $TARGET_ROOT_MOUNTPOINT
+    msg "Importing zpool $TARGET_ZPOOL to $TARGET_ROOT_MOUNTPOINT."
+    cmd zpool import -N -R $TARGET_ROOT_MOUNTPOINT $TARGET_ZPOOL
+    cmd zfs mount ${TARGET_ZPOOL}/ROOT/${ID}
+    cmd zfs mount ${TARGET_ZPOOL}/home
+
+    mount -t zfs | grep ${TARGET_ZPOOL}
+}
+
+unmount_filesystems() {
+    sleep 1
+    cmd umount -n -R $TARGET_ROOT_MOUNTPOINT
+}
+
 main() {
     # Make sure that we run with sufficient privileges.
     [ $UID -ne 0 ] && error "$0 must be run as root."
@@ -111,6 +131,10 @@ main() {
     create_loop_device
     setup_disk
 
+    export_zpool
+    mount_filesystems
+
+    unmount_filesystems
     export_zpool
     destroy_loop_device
 }
