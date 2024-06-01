@@ -7,6 +7,12 @@
 set -e
 
 # Global Variables
+DEB_CACHE_DIR=/home/df/src/ubuntu-jammi-zfs-cloud/debcache
+PROXY_SERVER="127.0.0.1"
+PROXY_PORT=3142
+TARGET_REPO_URL="http://archive.ubuntu.com/ubuntu/"
+TARGET_TIMEZONE="Europe/Berlin"
+TARGET_UTF8_LOCALES="en_US de_DE"
 TARGET_HOSTNAME="mycloudimg"
 TARGET_ZPOOL="croot"
 TARGET_IMAGE_PATH=$(pwd)
@@ -17,6 +23,12 @@ TARGET_ROOT_MOUNTPOINT=$(pwd)/tmp_root
 BOOT_PART="1"
 POOL_PART="2"
 ID="ubuntu"
+
+error_report() {
+	echo "Error on line $1"
+}
+
+trap 'error_report $LINENO' ERR
 
 msg() {
 	echo "$1"
@@ -44,7 +56,7 @@ target_cmd() {
 
 create_img_file() {
 	# Do some checking to prevent screwing up things...
-	local file="${TARGET_IMAGE_PATH}/${TARGET_IMAGE_NAME}" 
+	local file="${TARGET_IMAGE_PATH}/${TARGET_IMAGE_NAME}"
 	[ -e ${file} ] && error "${file} does already exist."
 	msg "Creating image file ${file}."
 	cmd dd if=/dev/zero of=${file} bs=1 count=0 seek=32212254720
@@ -52,7 +64,7 @@ create_img_file() {
 
 format_image_file() {
 	# Make sure the image file does exist.
-	local file="${TARGET_IMAGE_PATH}/${TARGET_IMAGE_NAME}" 
+	local file="${TARGET_IMAGE_PATH}/${TARGET_IMAGE_NAME}"
 	[ ! -e ${file} ] && error "${file} does not exist. Cannot create partitions."
 	# Parition the disk image for UEFI booting + ZFS Pool.
 	cmd_quiet sgdisk -n "${BOOT_PART}:1m:+512m" -t "${BOOT_PART}:ef00" "$file"
@@ -62,7 +74,7 @@ format_image_file() {
 
 create_loop_device() {
 	# Make sure the image file does exist.
-	local file="${TARGET_IMAGE_PATH}/${TARGET_IMAGE_NAME}" 
+	local file="${TARGET_IMAGE_PATH}/${TARGET_IMAGE_NAME}"
 	[ ! -e ${file} ] && error "${file} does not exist. Cannot create loop device."
 	# Cannot use cmd here, since the substitution would lead to something like
 	# LOOP_DEVICE=/dev/loopN which is not supposed to be executed.
@@ -128,6 +140,7 @@ mount_filesystems() {
 	cmd mount ${BOOT_DEVICE} ${TARGET_ROOT_MOUNTPOINT}/boot/efi
 }
 
+
 unmount_filesystems() {
 	sleep 1
 	cmd umount -n -R $TARGET_ROOT_MOUNTPOINT
@@ -135,7 +148,7 @@ unmount_filesystems() {
 
 setup_zbm() {
 	# Fetch the ZFS Boot menu if we don't already have a copy.
-	ZBM_CACHED=${TARGET_IMAGE_PATH}/BOOTX64.EFI 
+	ZBM_CACHED=${TARGET_IMAGE_PATH}/BOOTX64.EFI
 	ZBM_EFI_DIR=${TARGET_ROOT_MOUNTPOINT}/boot/efi/EFI/BOOT
 	if [ ! -e "${ZBM_CACHED}" ]; then
 	msg "Downloading ZBM ... to ${ZBM_CACHED}"
@@ -149,9 +162,57 @@ setup_zbm() {
 	cmd cp ${ZBM_CACHED} ${ZBM_EFI_DIR}
 }
 
+target_reconfigure_locales() {
+	local l
+	# Iterate over the desired UTF8 locales and uncomment any match in targets /etc/locale.gen
+	for l in $TARGET_UTF8_LOCALES; do
+		cmd sed -Ei "s/^\s*#\s*(${l}\.UTF-8.*$)/\1/" ${TARGET_ROOT_MOUNTPOINT}/etc/locale.gen
+	done
+
+	target_cmd dpkg-reconfigure -f noninteractive locales
+	target_cmd update-locale LANG=en_US.UTF-8
+}
+
+target_set_timezone() {
+	echo $TARGET_TIMEZONE > ${TARGET_ROOT_MOUNTPOINT}/etc/timezone
+	target_cmd dpkg-reconfigure -f noninteractive tzdata
+}
+
+target_set_keyboard() {
+	cat <<-EOF > ${TARGET_ROOT_MOUNTPOINT}/etc/default/keyboard
+	# KEYBOARD CONFIGURATION FILE
+
+	# Consult the keyboard(5) manual page.
+
+	XKBMODEL="pc105"
+	XKBLAYOUT="de"
+	XKBVARIANT="nodeadkeys"
+	XKBOPTIONS=""
+
+	BACKSPACE="guess"
+	EOF
+
+	target_cmd dpkg-reconfigure -f noninteractive keyboard-configuration
+}
+
+target_setup_apt_proxy() {
+	msg "Temporarily enabling proxy for target apt." 
+	cat <<-EOF > ${TARGET_ROOT_MOUNTPOINT}/etc/apt/apt.conf.d/01proxy
+	Acquire::http { Proxy "http://${PROXY_SERVER}:${PROXY_PORT}"; };
+	EOF
+}
+
+target_remove_apt_proxy() {
+	cmd rm ${TARGET_ROOT_MOUNTPOINT}/etc/apt/apt.conf.d/01proxy
+}
+
 bootstrap_os() {
-	msg "Bootstrapping OS..."
-	cmd debootstrap jammy ${TARGET_ROOT_MOUNTPOINT}
+	msg "Bootstrapping OS..." 
+	cmd mkdir -p ${DEB_CACHE_DIR}
+	cmd debootstrap --cache-dir=${DEB_CACHE_DIR} \
+		--include=tzdata,locales \
+		jammy ${TARGET_ROOT_MOUNTPOINT} \
+		${TARGET_REPO_URL}
 	cmd cp /etc/hostid ${TARGET_ROOT_MOUNTPOINT}/etc
 	cmd cp /etc/resolv.conf ${TARGET_ROOT_MOUNTPOINT}/etc
 	mount -t proc proc ${TARGET_ROOT_MOUNTPOINT}/proc
@@ -159,28 +220,33 @@ bootstrap_os() {
 	mount -B /dev ${TARGET_ROOT_MOUNTPOINT}/dev
 	mount -t devpts pts ${TARGET_ROOT_MOUNTPOINT}/dev/pts
 
-	cmd echo ${TARGET_HOSTNAME} > ${TARGET_ROOT_MOUNTPOINT}/etc/hostname
+	msg "echo ${TARGET_HOSTNAME} > ${TARGET_ROOT_MOUNTPOINT}/etc/hostname"
+	echo ${TARGET_HOSTNAME} > ${TARGET_ROOT_MOUNTPOINT}/etc/hostname
+
+	target_reconfigure_locales
 
 	# Need to use msg + echo here due to redirecting output to file.
-	msg echo -e "127.0.1.1\t${TARGET_HOSTNAME}" >> ${TARGET_ROOT_MOUNTPOINT}/etc/hosts
+	msg echo -e "\"127.0.1.1\t${TARGET_HOSTNAME}\" >> ${TARGET_ROOT_MOUNTPOINT}/etc/hosts"
 	echo -e "127.0.1.1\t${TARGET_HOSTNAME}" >> ${TARGET_ROOT_MOUNTPOINT}/etc/hosts
 
 	cat <<-EOF > ${TARGET_ROOT_MOUNTPOINT}/etc/apt/sources.list
-	deb http://archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
-	# deb-src http://archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
+	deb ${TARGET_REPO_URL} jammy main restricted universe multiverse
+	# deb-src ${TARGET_REPO_URL} jammy main restricted universe multiverse
 
-	deb http://archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse
-	# deb-src http://archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse
+	deb ${TARGET_REPO_URL} jammy-updates main restricted universe multiverse
+	# deb-src ${TARGET_REPO_URL} jammy-updates main restricted universe multiverse
 
-	deb http://archive.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse
-	# deb-src http://archive.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse
+	deb ${TARGET_REPO_URL} jammy-security main restricted universe multiverse
+	# deb-src ${TARGET_REPO_URL} jammy-security main restricted universe multiverse
 
-	deb http://archive.ubuntu.com/ubuntu/ jammy-backports main restricted universe multiverse
-	# deb-src http://archive.ubuntu.com/ubuntu/ jammy-backports main restricted universe multiverse
+	deb ${TARGET_REPO_URL} jammy-backports main restricted universe multiverse
+	# deb-src ${TARGET_REPO_URL} jammy-backports main restricted universe multiverse
 
-	deb http://archive.canonical.com/ubuntu/ jammy partner
-	# deb-src http://archive.canonical.com/ubuntu/ jammy partner
+	deb ${TARGET_REPO_URL} jammy partner
+	# deb-src ${TARGET_REPO_URL} jammy partner
 	EOF
+
+	target_setup_apt_proxy
 
 	# Update repository cache and system on target.
 	target_cmd apt update
@@ -190,10 +256,13 @@ bootstrap_os() {
 	target_cmd apt -y install --no-install-recommends linux-generic locales keyboard-configuration console-setup
 
 	# Configure packages to customize local and console properties
-	target_cmd dpkg-reconfigure locales tzdata keyboard-configuration console-setup
+	target_set_timezone
+#	target_reconfigure_locales
+	target_set_keyboard
+	target_cmd dpkg-reconfigure -f noninteractive console-setup
 
 	# Install required packages
-	target_cmd apt -y install dosfstools zfs-initramfs zfsutils-linux
+	target_cmd apt -y install --no-install-recommends dosfstools zfs-initramfs zfsutils-linux
 
 	# Enable systemd ZFS services
 	target_cmd systemctl enable zfs.target
@@ -203,6 +272,9 @@ bootstrap_os() {
 
 	# Rebuild the initramfs
 	target_cmd update-initramfs -c -k all
+
+	# Remove proxy from image.
+	target_remove_apt_proxy
 }
 
 main() {
