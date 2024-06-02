@@ -301,4 +301,4 @@ main() {
 
 main
 
-#vim: tabstop=4 noexpandtab
+# vim: ts=4 noet
