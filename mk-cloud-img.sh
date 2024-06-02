@@ -1,10 +1,8 @@
-#!/bin/bash
+#!/bin/bash -e
 
 # Sources of inspiration:
 # https://github.com/mvallim/cloud-image-ubuntu-from-scratch
 # https://docs.zfsbootmenu.org/en/v2.3.x/guides/ubuntu/uefi.html
-
-set -e
 
 # Global Variables
 DEB_CACHE_DIR=/home/df/src/ubuntu-jammi-zfs-cloud/debcache
@@ -24,14 +22,15 @@ BOOT_PART="1"
 POOL_PART="2"
 ID="ubuntu"
 
-error_report() {
-	echo "Error on line $1"
-}
-
-trap 'error_report $LINENO' ERR
+ME=$0
 
 msg() {
-	echo "$1"
+	echo "$ME: $1"
+}
+
+cmd() {
+	msg "$*"
+	$@
 }
 
 error() {
@@ -39,15 +38,34 @@ error() {
 	exit ${2:-1}
 }
 
-cmd() {
-	echo "$@"
-	$@
-}
-
 cmd_quiet() {
-	echo "$@"
+	msg "$*"
 	$@ 2>&1 > /dev/null
 }
+
+cleanup() {
+	# Try to automatically do the cleaning up in case of
+	# failure, user interruption or explicit call.
+	local ld pool
+	if mountpoint -q ${TARGET_ROOT_MOUNTPOINT}; then
+		msg "${TARGET_ROOT_MOUNTPOINT} is currently a mount point. Unmounting."
+		cmd umount -n -R "$TARGET_ROOT_MOUNTPOINT"
+	fi
+	
+	for pool in $(zpool list -Ho name); do
+		if [ $pool == $TARGET_ZPOOL ]; then
+			msg "Exporting pool $TARGET_ZPOOL"
+		fi
+	done
+
+	for ld in $(losetup | grep ${TARGET_IMAGE_NAME} | sed -E 's/(^\S+).*$/\1/'); do
+		msg "$TARGET_IMAGE_NAME is currently attached to $ld. Destroying $ld."
+		cmd losetup -d $ld
+	done
+}
+
+
+trap 'error_report $LINENO' ERR
 
 target_cmd() {
 	# Execute commands in chroot
@@ -66,7 +84,7 @@ format_image_file() {
 	# Make sure the image file does exist.
 	local file="${TARGET_IMAGE_PATH}/${TARGET_IMAGE_NAME}"
 	[ ! -e ${file} ] && error "${file} does not exist. Cannot create partitions."
-	# Parition the disk image for UEFI booting + ZFS Pool.
+	# Partition the disk image for UEFI booting + ZFS Pool.
 	cmd_quiet sgdisk -n "${BOOT_PART}:1m:+512m" -t "${BOOT_PART}:ef00" "$file"
 	cmd_quiet sgdisk -n "${POOL_PART}:0:-10m" -t "${POOL_PART}:bf00" "$file"
 }
@@ -112,7 +130,7 @@ setup_disk() {
 
 	cmd zpool set bootfs=${TARGET_ZPOOL}/ROOT/${ID} "$TARGET_ZPOOL"
 
-	# Format the efi boot partition.
+	# Format the UEFI boot partition.
 	cmd mkfs.vfat -F32 "$BOOT_DEVICE"
 }
 
@@ -135,7 +153,7 @@ mount_filesystems() {
 
 	mount -t zfs | grep ${TARGET_ZPOOL}
 
-	# Mount the efi partition
+	# Mount the UEFI partition
 	cmd mkdir -p ${TARGET_ROOT_MOUNTPOINT}/boot/efi
 	cmd mount ${BOOT_DEVICE} ${TARGET_ROOT_MOUNTPOINT}/boot/efi
 }
@@ -291,9 +309,8 @@ main() {
 	setup_zbm
 	bootstrap_os
 
-	ls -l $ZBM_EFI_DIR
-	mount | grep $TARGET_ROOT_MOUNTPOINT
-
+	cleanup
+	exit 
 	unmount_filesystems
 	export_zpool
 	destroy_loop_device
