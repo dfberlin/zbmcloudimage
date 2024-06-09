@@ -1,4 +1,8 @@
-#!/bin/bash -e
+#!/bin/bash
+
+set -eE
+trap 'error_cleanup_report $LINENO $? $FUNCNAME' ERR 
+trap 'sigint_handler' SIGINT
 
 # Sources of inspiration:
 # https://github.com/mvallim/cloud-image-ubuntu-from-scratch
@@ -22,10 +26,32 @@ BOOT_PART="1"
 POOL_PART="2"
 ID="ubuntu"
 
-ME=$0
+error_report() {
+    local line=$1
+    local exit_status=$2
+    local func=${3:-"none"}
+    local msg="$0:$line exited with status $exit_status"
+    [ $func != "none" ] && msg="$msg in function $func"
+    echo $msg
+    exit $exit_status
+}
+
+error_cleanup_report() {
+    # Call cleanup  ...
+	cleanup
+    error_report $1 $2 $3
+}
+
+sigint_handler() {
+	msg "Caught SIGINT -> Cleanup and exit."
+	cleanup
+	msg "Removing potentially unfinished image file $TARGET_IMAGE_NAME."
+	cmd rm ${TARGET_IMAGE_PATH}/${TARGET_IMAGE_NAME}
+	exit
+}
 
 msg() {
-	echo "$ME: $1"
+	echo "$0: $1"
 }
 
 cmd() {
@@ -55,6 +81,7 @@ cleanup() {
 	for pool in $(zpool list -Ho name); do
 		if [ $pool == $TARGET_ZPOOL ]; then
 			msg "Exporting pool $TARGET_ZPOOL"
+			cmd zpool export $TARGET_ZPOOL
 		fi
 	done
 
@@ -63,9 +90,6 @@ cleanup() {
 		cmd losetup -d $ld
 	done
 }
-
-
-trap 'error_report $LINENO' ERR
 
 target_cmd() {
 	# Execute commands in chroot
